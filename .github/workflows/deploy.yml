@@ -1,0 +1,45 @@
+name: Deploy Static Content to Pages
+
+on:
+  # 监听 main 分支的 push 事件（如果您主分支是 master，请修改为 master）
+  push:
+    branches: ["main"]
+
+  # 允许在 Actions 页面手动触发
+  workflow_dispatch:
+
+# 设置权限，允许 GITHUB_TOKEN 部署 Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 并发控制：取消正在进行的重复构建
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  # 部署任务
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (检出代码)
+        uses: actions/checkout@v4
+
+      - name: Setup Pages (设置 Pages 环境)
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact (上传构建产物)
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # 指定要部署的目录，'.' 代表当前根目录的所有文件
+          # 如果您的网页源码都在一个叫 'dist' 或 'public' 的子文件夹里，请改为 path: './dist'
+          path: '.'
+
+      - name: Deploy to GitHub Pages (部署)
+        id: deployment
+        uses: actions/deploy-pages@v4
