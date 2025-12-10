@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <title>Magical Christmas Hand Interaction</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Arial', sans-serif; }
+        
+        /* 视频必须存在于布局中但不可见，这是 MediaPipe 的关键要求 */
+        #input_video {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 320px;
+            height: 240px;
+            opacity: 0; /* 隐藏但保留渲染 */
+            z-index: -10;
+        }
+
+        /* 3D 容器 */
+        #canvas-container { width: 100vw; height: 100vh; display: block; }
+
+        /* UI 文字：圣诞快乐 */
+        #ui-text {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%) scale(0);
+            font-size: 5rem;
+            font-weight: 900;
+            color: #FFD700;
+            text-shadow: 0 0 20px #FFD700, 0 0 40px #ff0000;
+            pointer-events: none;
+            opacity: 0;
+            transition: transform 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275), opacity 0.5s;
+            text-align: center;
+            white-space: nowrap;
+            letter-spacing: 5px;
+        }
+        #ui-text.active {
+            transform: translate(-50%, -50%) scale(1);
+            opacity: 1;
+        }
+
+        /* 左上角调试信息 */
+        #debug-status {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: #00ff00;
+            font-size: 14px;
+            background: rgba(0,0,0,0.5);
+            padding: 5px 10px;
+            border-radius: 4px;
+            pointer-events: none;
+        }
+
+        /* 右下角交互指示器 */
+        #interaction-dot {
+            position: absolute;
+            bottom: 30px;
+            right: 30px;
+            width: 20px;
+            height: 20px;
+            background-color: #333;
+            border-radius: 50%;
+            border: 2px solid #555;
+            transition: all 0.1s;
+        }
+    </style>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <video id="input_video"></video>
+
+    <div id="canvas-container"></div>
+
+    <div id="ui-text">MERRY CHRISTMAS</div>
+    <div id="debug-status">系统初始化中... 请允许摄像头权限</div>
+    <div id="interaction-dot"></div>
+
+    <script>
+        // ==========================================
+        // 1. 全局变量与状态
+        // ==========================================
+        let scene, camera, renderer, particles, treeGroup;
+        const particleCount = 8000;
+        let openness = 0; // 0 = 闭合, 1 = 张开
+        let targetOpenness = 0;
+        let treeRotationSpeed = 0.005;
+        
+        // 状态 DOM
+        const statusEl = document.getElementById('debug-status');
+        const dotEl = document.getElementById('interaction-dot');
+        const textEl = document.getElementById('ui-text');
+
+        // ==========================================
+        // 2. 辅助函数：Canvas 纹理生成
+        // ==========================================
+        
+        // 生成发光圆点贴图 (用于粒子)
+        function createParticleTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 32; canvas.height = 32;
+            const ctx = canvas.getContext('2d');
+            const grad = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+            grad.addColorStop(0, 'rgba(255, 215, 0, 1)'); // 暖金中心
+            grad.addColorStop(0.4, 'rgba(255, 215, 0, 0.5)');
+            grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, 32, 32);
+            const texture = new THREE.CanvasTexture(canvas);
+            return texture;
+        }
+
+        // 生成礼物盒贴图 (带金色十字丝带)
+        function createGiftTexture(colorHex) {
+            const size = 128;
+            const canvas = document.createElement('canvas');
+            canvas.width = size; canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            
+            // 背景色
+            ctx.fillStyle = colorHex;
+            ctx.fillRect(0, 0, size, size);
+            
+            // 金色丝带
+            ctx.fillStyle = '#FFD700';
+            const ribbonWidth = 20;
+            // 垂直
+            ctx.fillRect((size - ribbonWidth)/2, 0, ribbonWidth, size);
+            // 水平
+            ctx.fillRect(0, (size - ribbonWidth)/2, size, ribbonWidth);
+
+            return new THREE.CanvasTexture(canvas);
+        }
+
+        // 生成光晕贴图 (用于星星)
+        function createGlowTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 64; canvas.height = 64;
+            const ctx = canvas.getContext('2d');
+            const grad = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+            grad.addColorStop(0, 'rgba(255, 255, 255, 1)');
+            grad.addColorStop(0.3, 'rgba(255, 215, 0, 0.6)');
+            grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, 64, 64);
+            return new THREE.CanvasTexture(canvas);
+        }
+
+        // ==========================================
+        // 3. Three.js 场景构建
+        // ==========================================
+        function initThree() {
+            const container = document.getElementById('canvas-container');
+            
+            // 场景设置
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x000000); // 强制纯黑
+            scene.fog = new THREE.FogExp2(0x000000, 0.02); // 黑色雾
+
+            // 相机
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 5, 20);
+            camera.lookAt(0, 2, 0);
+
+            // 渲染器
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false }); // Alpha false
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            container.appendChild(renderer.domElement);
+
+            // 灯光
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+            scene.add(ambientLight);
+            const pointLight = new THREE.PointLight(0xffd700, 1, 50);
+            pointLight.position.set(5, 10, 5);
+            scene.add(pointLight);
+
+            // --- 构建圣诞树 (堆叠礼物盒) ---
+            treeGroup = new THREE.Group();
+            const colors = ['#D32F2F', '#1B5E20', '#FFFFFF', '#D4AF37']; // 红、绿、白、金
+            const levels = 10;
+            
+            for(let y=0; y<levels; y++) {
+                const radius = 4 - (y * 0.4); // 半径递减
+                const boxCount = Math.floor(radius * 3) + 1;
+                
+                for(let i=0; i<boxCount; i++) {
+                    const angle = (i / boxCount) * Math.PI * 2 + (y * 0.5);
+                    const x = Math.cos(angle) * radius;
+                    const z = Math.sin(angle) * radius;
+                    
+                    const boxColor = colors[Math.floor(Math.random() * colors.length)];
+                    const geometry = new THREE.BoxGeometry(0.8, 0.8, 0.8);
+                    const material = new THREE.MeshStandardMaterial({
+                        map: createGiftTexture(boxColor),
+                        roughness: 0.3
+                    });
+                    
+                    const box = new THREE.Mesh(geometry, material);
+                    box.position.set(x, y * 0.8, z);
+                    
+                    // 随机微调旋转，增加自然感
+                    box.rotation.y = Math.random() * Math.PI;
+                    treeGroup.add(box);
+                }
+            }
+            
+            // --- 树顶星星 ---
+            const starGeo = new THREE.IcosahedronGeometry(0.6, 0);
+            const starMat = new THREE.MeshBasicMaterial({ color: 0xFFFF00 });
+            const star = new THREE.Mesh(starGeo, starMat);
+            star.position.y = levels * 0.8 + 0.5;
+            treeGroup.add(star);
+
+            // --- 星星光晕 ---
+            const spriteMat = new THREE.SpriteMaterial({ 
+                map: createGlowTexture(), 
+                color: 0xffaa00, 
+                transparent: true, 
+                blending: THREE.AdditiveBlending 
+            });
+            const glow = new THREE.Sprite(spriteMat);
+            glow.scale.set(6, 6, 1);
+            star.add(glow);
+
+            scene.add(treeGroup);
+
+            // --- 粒子系统 (背景) ---
+            const particlesGeo = new THREE.BufferGeometry();
+            const posArray = new Float32Array(particleCount * 3);
+            
+            for(let i=0; i<particleCount * 3; i++) {
+                posArray[i] = (Math.random() - 0.5) * 50; // 范围
+            }
+            
+            particlesGeo.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
+            
+            const particlesMat = new THREE.PointsMaterial({
+                size: 0.3,
+                map: createParticleTexture(),
+                transparent: true,
+                color: 0xFFD700,
+                depthWrite: false,
+                blending: THREE.AdditiveBlending,
+                sizeAttenuation: true
+            });
+            
+            particles = new THREE.Points(particlesGeo, particlesMat);
+            scene.add(particles);
+
+            // 窗口缩放适配
+            window.addEventListener('resize', onWindowResize, false);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // ==========================================
+        // 4. MediaPipe Hands 设置
+        // ==========================================
+        function initMediaPipe() {
+            const videoElement = document.getElementById('input_video');
+            
+            const hands = new Hands({locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+            }});
+
+            hands.setOptions({
+                maxNumHands: 1,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.5,
+                minTrackingConfidence: 0.5
+            });
+
+            hands.onResults(onResults);
+
+            const cameraUtils = new Camera(videoElement, {
+                onFrame: async () => {
+                    await hands.send({image: videoElement});
+                },
+                width: 320,
+                height: 240
+            });
+            cameraUtils.start()
+                .then(() => statusEl.innerText = "系统正常：请向摄像头展示手势")
+                .catch(err => statusEl.innerText = "摄像头错误：" + err);
+        }
+
+        function onResults(results) {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                
+                // 关键点：4 (拇指尖), 8 (食指尖)
+                const thumbTip = landmarks[4];
+                const indexTip = landmarks[8];
+                
+                // 计算欧几里得距离 (简单估算)
+                const distance = Math.sqrt(
+                    Math.pow(thumbTip.x - indexTip.x, 2) + 
+                    Math.pow(thumbTip.y - indexTip.y, 2)
+                );
+
+                // 映射距离到 0-1 的 openness
+                // 距离通常在 0.02 (闭合) 到 0.15+ (张开) 之间
+                const minD = 0.03;
+                const maxD = 0.15;
+                let rawOpen = (distance - minD) / (maxD - minD);
+                targetOpenness = Math.max(0, Math.min(1, rawOpen)); // Clamp
+
+                // 调试 UI 更新
+                const brightness = 50 + (targetOpenness * 205);
+                dotEl.style.backgroundColor = `rgb(${brightness}, ${brightness}, 0)`;
+                dotEl.style.boxShadow = `0 0 ${10 + targetOpenness * 20}px #FFD700`;
+
+            } else {
+                // 未检测到手，缓慢恢复到闭合状态
+                targetOpenness = 0;
+                dotEl.style.backgroundColor = '#333';
+                dotEl.style.boxShadow = 'none';
+            }
+        }
+
+        // ==========================================
+        // 5. 动画循环
+        // ==========================================
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // 平滑插值 openness
+            openness += (targetOpenness - openness) * 0.1;
+
+            // --- 树的交互 ---
+            // 旋转：基础速度 + 基于张开度的加速
+            const currentSpeed = 0.005 + (openness * 0.05);
+            treeGroup.rotation.y += currentSpeed;
+
+            // 呼吸缩放：基于张开度放大
+            const targetScale = 1 + (openness * 0.2); // 最大放大 1.2倍
+            treeGroup.scale.setScalar(THREE.MathUtils.lerp(treeGroup.scale.x, targetScale, 0.1));
+
+            // --- 文字交互 ---
+            if (openness > 0.6) {
+                textEl.classList.add('active');
+            } else {
+                textEl.classList.remove('active');
+            }
+
+            // --- 粒子系统 (雪花) ---
+            const positions = particles.geometry.attributes.position.array;
+            
+            // 基础下落速度
+            let gravity = -0.05; 
+            // 反重力：如果张开，gravity 变为正数
+            if (openness > 0.3) {
+                gravity = 0.1 + (openness * 0.2); // 飞升速度
+            }
+
+            for(let i=1; i<particleCount * 3; i+=3) {
+                positions[i] += gravity;
+
+                // 边界循环处理
+                if (positions[i] < -25) {
+                    positions[i] = 25;
+                }
+                if (positions[i] > 25) {
+                    positions[i] = -25;
+                }
+            }
+            particles.geometry.attributes.position.needsUpdate = true;
+
+            renderer.render(scene, camera);
+        }
+
+        // ==========================================
+        // 6. 启动
+        // ==========================================
+        initThree();
+        initMediaPipe();
+        animate();
+
+    </script>
+</body>
+</html>
